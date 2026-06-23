@@ -1,5 +1,5 @@
 import streamlit as st
-import akshare as ak
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -8,35 +8,54 @@ from datetime import datetime, timedelta
 
 # ==================== 页面基础配置 ====================
 st.set_page_config(
-    page_title="真实A股行情预测看板",
+    page_title="真实行情预测看板",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("📈 A股真实行情与趋势预测看板")
-st.caption("数据来源：东方财富 | 仅供学习研究，不构成投资建议")
+st.title("📈 全球市场真实行情与趋势预测看板")
+st.caption("数据来源：雅虎财经 | 仅供学习研究，不构成投资建议")
 st.divider()
 
-# ==================== 缓存数据获取函数 ====================
-@st.cache_data(ttl=3600)  # 缓存1小时，避免频繁请求接口
-def get_all_stock_list():
-    """获取全A股股票代码+名称列表"""
-    df = ak.stock_info_a_code_name()
-    df["label"] = df["code"] + " " + df["name"]
-    return df
+# ==================== 辅助函数：股票代码格式补全 ====================
+def format_stock_code(code):
+    """自动识别市场，补全股票代码后缀"""
+    code = code.strip()
+    # 已带后缀直接返回
+    if "." in code:
+        return code
+    # 纯数字判断市场
+    if code.isdigit():
+        if len(code) == 6:
+            # A股：6/688开头为沪市，0/3开头为深市
+            if code.startswith(("6", "688")):
+                return f"{code}.SS"
+            else:
+                return f"{code}.SZ"
+        elif len(code) <= 5:
+            # 港股自动补零到5位
+            return f"{code.zfill(5)}.HK"
+    # 纯字母默认按美股处理
+    return code
 
-@st.cache_data(ttl=1800)
-def get_stock_history(code, start_date, end_date, adjust="qfq"):
-    """获取单只股票历史日线数据"""
-    df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust=adjust
-    )
-    # 格式化日期列，方便后续处理
-    df["日期"] = pd.to_datetime(df["日期"])
+# ==================== 缓存数据获取函数 ====================
+@st.cache_data(ttl=3600)  # 缓存1小时，避免频繁请求
+def get_stock_history(code, period="180d", interval="1d"):
+    """获取股票历史行情数据"""
+    ticker = yf.Ticker(code)
+    df = ticker.history(period=period, interval=interval, auto_adjust=True)
+    if df.empty:
+        return pd.DataFrame()
+    # 重置索引、去除时区、统一中文列名
+    df = df.reset_index()
+    df["日期"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df = df.rename(columns={
+        "Open": "开盘",
+        "High": "最高",
+        "Low": "最低",
+        "Close": "收盘",
+        "Volume": "成交量"
+    })
     df = df.sort_values("日期").reset_index(drop=True)
     return df
 
@@ -44,68 +63,66 @@ def get_stock_history(code, start_date, end_date, adjust="qfq"):
 with st.sidebar:
     st.subheader("选股与参数设置")
     
-    # 1. 股票选择
-    try:
-        stock_df = get_all_stock_list()
-        stock_options = stock_df["label"].tolist()
-        # 默认选中平安银行作为示例
-        default_idx = stock_options.index("000001 平安银行") if "000001 平安银行" in stock_options else 0
-        selected = st.selectbox("选择股票", stock_options, index=default_idx)
-        stock_code = selected.split(" ")[0]
-        stock_name = selected.split(" ")[1]
-    except Exception as e:
-        st.error("股票列表加载失败，请刷新重试")
-        stock_code = "000001"
-        stock_name = "平安银行"
+    # 热门股票快速选择
+    hot_stocks = {
+        "000001 平安银行": "000001",
+        "000002 万科A": "000002",
+        "600519 贵州茅台": "600519",
+        "300750 宁德时代": "300750",
+        "00700 腾讯控股": "00700",
+        "AAPL 苹果": "AAPL",
+        "TSLA 特斯拉": "TSLA"
+    }
+    selected_hot = st.selectbox("热门股票快速选择", list(hot_stocks.keys()), index=1)
+    
+    # 支持手动输入任意代码
+    manual_code = st.text_input("手动输入股票代码", value=hot_stocks[selected_hot],
+                               help="A股输6位代码、港股输5位代码、美股输英文代码")
+    stock_code = format_stock_code(manual_code)
 
-    # 2. 时间范围
-    end_default = datetime.now().strftime("%Y%m%d")
-    start_default = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.text_input("开始日期", value=start_default, help="格式：YYYYMMDD")
-    with col2:
-        end_date = st.text_input("结束日期", value=end_default, help="格式：YYYYMMDD")
+    # 历史行情周期选择
+    period_options = {
+        "近1个月": "30d",
+        "近3个月": "90d",
+        "近半年": "180d",
+        "近1年": "1y",
+        "近3年": "3y"
+    }
+    selected_period = st.selectbox("历史行情周期", list(period_options.keys()), index=2)
+    period_value = period_options[selected_period]
 
-    # 3. 复权方式
-    adjust_type = st.selectbox(
-        "复权方式",
-        ["qfq", "hfq", ""],
-        format_func=lambda x: {"qfq":"前复权","hfq":"后复权","":"不复权"}[x],
-        index=0
-    )
-
-    # 4. 预测天数
+    # 预测天数调节
     predict_days = st.slider("趋势预测天数", min_value=1, max_value=30, value=7)
 
     st.divider()
-    st.caption("数据每30分钟自动更新一次")
+    st.caption("数据每1小时自动更新一次")
 
 # ==================== 主内容区 ====================
 try:
     # 获取历史数据
-    history_df = get_stock_history(stock_code, start_date, end_date, adjust_type)
+    history_df = get_stock_history(stock_code, period_value)
     
     if history_df.empty:
-        st.warning("未查询到该时间段数据，请调整日期后重试")
+        st.warning("未查询到该股票数据，请检查股票代码后重试")
     else:
         # ========== 1. 核心指标卡片 ==========
         latest = history_df.iloc[-1]
         prev = history_df.iloc[-2]
+        change_pct = round((latest["收盘"] - prev["收盘"]) / prev["收盘"] * 100, 2)
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("最新收盘价", f"{latest['收盘']} 元", f"{latest['涨跌幅']}%")
-        col2.metric("当日最高", f"{latest['最高']} 元")
-        col3.metric("当日最低", f"{latest['最低']} 元")
-        col4.metric("换手率", f"{latest['换手率']}%")
+        col1.metric("最新收盘价", f"{round(latest['收盘'], 2)} 元", f"{change_pct}%")
+        col2.metric("当日最高", f"{round(latest['最高'], 2)} 元")
+        col3.metric("当日最低", f"{round(latest['最低'], 2)} 元")
+        col4.metric("当日成交量", f"{int(latest['成交量']):,}")
         
         st.divider()
 
-        # ========== 2. K线走势图 ==========
+        # ========== 2. 多标签页功能 ==========
         tab1, tab2, tab3, tab4 = st.tabs(["K线行情", "历史数据", "技术指标", "趋势预测"])
         
         with tab1:
-            st.subheader(f"{stock_name}（{stock_code}）K线走势")
+            st.subheader(f"{manual_code} K线走势")
             fig = go.Figure(data=[go.Candlestick(
                 x=history_df["日期"],
                 open=history_df["开盘"],
@@ -117,27 +134,22 @@ try:
             fig.update_layout(xaxis_rangeslider_visible=False, height=500)
             st.plotly_chart(fig, use_container_width=True)
 
-        # ========== 3. 历史数据明细 ==========
         with tab2:
             st.subheader("历史行情明细")
-            # 按日期倒序展示
-            st.dataframe(
-                history_df.sort_values("日期", ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
+            display_df = history_df[["日期", "开盘", "最高", "最低", "收盘", "成交量"]].copy()
+            display_df = display_df.sort_values("日期", ascending=False).reset_index(drop=True)
+            numeric_cols = ["开盘", "最高", "最低", "收盘"]
+            display_df[numeric_cols] = display_df[numeric_cols].round(2)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        # ========== 4. 技术指标 ==========
         with tab3:
-            st.subheader("常用技术指标")
-            # 计算移动平均线
+            st.subheader("均线技术指标")
             df_indicator = history_df.copy()
             df_indicator["MA5"] = df_indicator["收盘"].rolling(5).mean()
             df_indicator["MA10"] = df_indicator["收盘"].rolling(10).mean()
             df_indicator["MA20"] = df_indicator["收盘"].rolling(20).mean()
             df_indicator["MA60"] = df_indicator["收盘"].rolling(60).mean()
             
-            # 绘制均线图
             fig_ma = go.Figure()
             fig_ma.add_trace(go.Scatter(x=df_indicator["日期"], y=df_indicator["收盘"], name="收盘价", line_color="#1f77b4"))
             fig_ma.add_trace(go.Scatter(x=df_indicator["日期"], y=df_indicator["MA5"], name="MA5", line_color="#ff7f0e"))
@@ -149,12 +161,11 @@ try:
             
             st.caption("MA5/10/20/60 分别代表5日、10日、20日、60日移动平均线")
 
-        # ========== 5. 线性回归趋势预测 ==========
         with tab4:
             st.subheader(f"未来{predict_days}天趋势预测（线性回归模型）")
             st.info("⚠️ 本预测仅基于历史价格的数学趋势拟合，不代表真实未来走势，股市有风险，投资需谨慎")
             
-            # 数据准备：用日期序号作为特征，收盘价作为标签
+            # 数据准备：用日期序号作为特征
             close_prices = history_df["收盘"].values.reshape(-1, 1)
             days_index = np.arange(len(close_prices)).reshape(-1, 1)
             
@@ -162,15 +173,15 @@ try:
             model = LinearRegression()
             model.fit(days_index, close_prices)
             
-            # 生成未来天数的序号
+            # 生成未来预测序列
             future_index = np.arange(len(close_prices), len(close_prices)+predict_days).reshape(-1, 1)
             future_pred = model.predict(future_index).flatten()
             
-            # 构造预测结果日期
+            # 按交易日生成预测日期
             last_date = history_df["日期"].iloc[-1]
-            future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=predict_days, freq="B")
+            future_dates = pd.bdate_range(start=last_date + timedelta(days=1), periods=predict_days)
             
-            # 绘制预测图
+            # 绘制预测对比图
             fig_pred = go.Figure()
             fig_pred.add_trace(go.Scatter(
                 x=history_df["日期"], y=history_df["收盘"],
@@ -186,10 +197,10 @@ try:
             # 预测结果表格
             pred_df = pd.DataFrame({
                 "预测日期": future_dates.strftime("%Y-%m-%d"),
-                "预测收盘价(元)": np.round(future_pred, 2)
+                "预测收盘价": np.round(future_pred, 2)
             })
             st.dataframe(pred_df, use_container_width=True, hide_index=True)
 
 except Exception as e:
     st.error(f"数据加载失败：{str(e)}")
-    st.caption("可能原因：网络波动、日期格式错误或接口限流，请稍后重试")
+    st.caption("请检查股票代码是否正确，或稍后重试")
